@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
@@ -127,6 +128,71 @@ def get_info(ticker: str) -> dict:
     return out
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_symbols(query: str) -> list[dict]:
+    """Recherche d'actifs par nom d'entreprise ou symbole (actions, ETF, fonds, cryptos)."""
+    query = query.strip()
+    if len(query) < 2:
+        return []
+    try:
+        quotes = yf.Search(query, max_results=8, news_count=0).quotes
+    except Exception:
+        return []
+    allowed = {"EQUITY", "ETF", "MUTUALFUND", "CRYPTOCURRENCY"}
+    out = []
+    for q in quotes:
+        sym = q.get("symbol")
+        if not sym or (q.get("quoteType") and q["quoteType"] not in allowed):
+            continue
+        out.append(
+            {
+                "symbol": sym,
+                "name": q.get("longname") or q.get("shortname") or sym,
+                "exchange": q.get("exchDisp") or q.get("exchange") or "",
+                "type": q.get("quoteType") or "",
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_ohlcv(ticker: str, start: str) -> pd.DataFrame:
+    """Cours (clôture brute), plus haut, plus bas et volume quotidiens."""
+    try:
+        df = yf.Ticker(ticker).history(start=start, auto_adjust=False)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna(subset=["Close"]).copy()
+    for col, default in (("High", df["Close"]), ("Low", df["Close"]), ("Volume", 0.0)):
+        if col not in df.columns:
+            df[col] = default
+    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+    return df[~df.index.duplicated(keep="last")][["Close", "High", "Low", "Volume"]]
+
+
+PERIODS = {"1M": 30, "3M": 91, "6M": 182, "1A": 365, "5A": 1826}
+
+
+def price_chart(df: pd.DataFrame, days: int, title: str) -> go.Figure:
+    """Cours + moyennes mobiles 50/200 jours (calculées sur tout l'historique) + volumes."""
+    ma50 = df["Close"].rolling(50).mean()
+    ma200 = df["Close"].rolling(200).mean()
+    cut = df.index[-1] - pd.Timedelta(days=days)
+    view = df[df.index >= cut]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(go.Scatter(x=view.index, y=view["Close"], name="Cours", line=dict(width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=view.index, y=ma50[view.index], name="Moyenne 50 j", line=dict(width=1, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=view.index, y=ma200[view.index], name="Moyenne 200 j", line=dict(width=1, dash="dash")), row=1, col=1)
+    fig.add_trace(go.Bar(x=view.index, y=view["Volume"], name="Volume", marker_color="#5B6178"), row=2, col=1)
+    fig.update_layout(template="plotly_dark", title=title, height=520, legend=dict(orientation="h", y=1.08), margin=dict(t=80))
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    return fig
+
+
 def fx_on(cur: str, date) -> float:
     """Taux devise -> USD à une date donnée (dernier cours connu avant cette date)."""
     if cur == "USD":
@@ -212,17 +278,33 @@ st.sidebar.header("📈 Ordres")
 t_buy, t_sell, t_div = st.sidebar.tabs(["Acheter", "Vendre", "Dividende"])
 
 with t_buy:
-    b_ticker = st.text_input("Symbole boursier", "AAPL", key="b_ticker").upper().strip()
+    b_query = st.text_input(
+        "Rechercher une entreprise ou un fonds", placeholder="ex : Nvidia, LVMH, MSCI World, AAPL", key="b_query"
+    )
+    b_ticker = ""
+    results = search_symbols(b_query) if b_query else []
+    if results:
+        labels = [f"{r['name']} ({r['symbol']}) · {r['exchange']}" for r in results]
+        pick = st.selectbox("Résultats", range(len(results)), format_func=lambda i: labels[i], key=f"b_pick_{b_query}")
+        b_ticker = results[pick]["symbol"]
+    elif b_query:
+        b_ticker = b_query.upper().strip()
+        st.caption("Aucune suggestion : le texte saisi est utilisé comme symbole.")
+    else:
+        st.caption("Tape un nom d'entreprise, pas besoin de connaître le symbole.")
+    if b_ticker:
+        st.session_state["sel_ticker"] = b_ticker
+
     last, cur = 0.0, "USD"
     if b_ticker:
         h = get_history(b_ticker, RECENT)
         if not h.empty:
             info = get_info(b_ticker)
             last, cur = float(h.iloc[-1]), info["currency"]
-            st.success(f"📌 **{info['name']}**\n\n💵 Dernier cours : `{last:.2f} {cur}`")
-            st.line_chart(get_history(b_ticker, (TODAY - dt.timedelta(days=90)).isoformat()))
+            st.success(f"📌 **{info['name']}** ({b_ticker})\n\n💵 Dernier cours : `{last:.2f} {cur}`")
+            st.caption("📊 Graphique complet dans l'onglet **Explorer** (page principale).")
         else:
-            st.warning("⚠️ Symbole introuvable (ex : AAPL, MSFT, MC.PA).")
+            st.warning("⚠️ Actif introuvable ou données indisponibles.")
     with st.form("buy_form"):
         b_date = st.date_input("Date de l'ordre", value=TODAY, max_value=TODAY)
         b_qty = st.number_input("Unités", min_value=0.001, value=1.0, step=1.0)
@@ -345,8 +427,8 @@ if not tx.empty:
         series, assets = core.build_series(tx, prices, fxs)
         r_daily = core.daily_returns(series["value"], series["flow"])
 
-tab_perf, tab_risk, tab_alloc, tab_markets, tab_news, tab_book = st.tabs(
-    ["📊 Performance", "⚠️ Risque", "🏢 Allocation", "📉 Marchés & VIX", "📰 Actualités", "📄 Carnet & Import/Export"]
+tab_perf, tab_explore, tab_risk, tab_alloc, tab_markets, tab_news, tab_book = st.tabs(
+    ["📊 Performance", "🔎 Explorer", "⚠️ Risque", "🏢 Allocation", "📉 Marchés & VIX", "📰 Actualités", "📄 Carnet & Import/Export"]
 )
 
 # --------------------------------------------------------------------------
@@ -403,6 +485,39 @@ with tab_perf:
                        color_continuous_scale="RdYlGn", color_continuous_midpoint=0),
                 width="stretch",
             )
+
+# --------------------------------------------------------------------------
+with tab_explore:
+    sel = st.session_state.get("sel_ticker")
+    if not sel:
+        st.info("Cherche une entreprise dans la barre latérale (onglet Acheter) : son graphique s'affichera ici.")
+    else:
+        info_x = get_info(sel)
+        df_x = get_ohlcv(sel, (TODAY - dt.timedelta(days=6 * 365)).isoformat())
+        if df_x.empty:
+            st.warning(f"Données indisponibles pour {sel}.")
+        else:
+            st.subheader(f"{info_x['name']} ({sel})")
+            period = st.radio("Période", list(PERIODS), index=3, horizontal=True, key="period")
+            days = PERIODS[period]
+            close = df_x["Close"]
+            last_x = float(close.iloc[-1])
+            in_period = close[close.index >= close.index[-1] - pd.Timedelta(days=days)]
+            chg = last_x / float(in_period.iloc[0]) - 1
+            y1 = df_x[df_x.index >= df_x.index[-1] - pd.Timedelta(days=365)]
+            hi, lo = float(y1["High"].max()), float(y1["Low"].min())
+            ma200 = close.rolling(200).mean().iloc[-1]
+            cur_x = info_x["currency"]
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Dernier cours", f"{last_x:,.2f} {cur_x}", f"{chg * 100:+.2f}% sur {period}")
+            k2.metric("Plus haut 52 sem.", f"{hi:,.2f} {cur_x}", f"{(last_x / hi - 1) * 100:.1f}% du sommet")
+            k3.metric("Plus bas 52 sem.", f"{lo:,.2f} {cur_x}", f"{(last_x / lo - 1) * 100:+.1f}% du creux")
+            if pd.notna(ma200):
+                k4.metric("Moyenne 200 jours", f"{ma200:,.2f} {cur_x}", f"{(last_x / ma200 - 1) * 100:+.1f}% d'écart")
+            else:
+                k4.metric("Moyenne 200 jours", "n/a", "historique trop court")
+            st.plotly_chart(price_chart(df_x, days, f"{sel} : cours, moyennes mobiles et volumes"), width="stretch")
 
 # --------------------------------------------------------------------------
 with tab_risk:
